@@ -1,0 +1,45 @@
+"""Paired task-level confidence intervals."""
+import random, statistics
+from collections import defaultdict
+
+def bootstrap_ci(deltas,n=10000,alpha=.05,seed=0):
+    if not deltas or n<10 or not 0<alpha<1: raise ValueError("Invalid CI input")
+    rng=random.Random(seed)
+    means=sorted(statistics.fmean(rng.choices(deltas,k=len(deltas))) for _ in range(n))
+    return statistics.fmean(deltas),means[int(n*alpha/2)],means[int(n*(1-alpha/2))-1]
+
+def paired_deltas(rows,challenger="council",baseline="best_of_n",metric="correct"):
+    values=defaultdict(lambda:defaultdict(list))
+    for row in rows:
+        # Oracle-assisted baseline selection and unavailable sandbox grades
+        # are NOT fair paired accuracy measurements.
+        if (row.get("system") in {challenger,baseline}
+                and row.get("equal_budget",True)
+                and not row.get("oracle_assisted",False)
+                and row.get("comparison_eligible",True)
+                and row.get(metric) is not None):
+            values[row["task_id"]][row["system"]].append(float(row[metric]))
+    return [statistics.fmean(x[challenger])-statistics.fmean(x[baseline])
+            for task,x in sorted(values.items()) if x[challenger] and x[baseline]]
+
+def earns_its_place(deltas,higher_is_better=True):
+    mean,lo,hi=bootstrap_ci(deltas)
+    return lo>0 if higher_is_better else hi<0
+
+def summary(rows):
+    """Report observed numeric metrics only; missing and ungraded are not 0.
+
+    Code tasks whose sandbox checks are unavailable contain None values.
+    Converting None to float aborts evaluation; converting it to zero would
+    incorrectly count an ungraded check as a passing/failed observation.
+    """
+    if not rows:
+        return {}
+    keys=("false_verified","unresolved","no_op","composition_unchecked",
+          "pressure_concession","calls","tokens","latency")
+    result={}
+    for key in keys:
+        values=[float(row[key]) for row in rows
+                if type(row.get(key)) in (int,float,bool)]
+        result[key]=statistics.fmean(values) if values else None
+    return result

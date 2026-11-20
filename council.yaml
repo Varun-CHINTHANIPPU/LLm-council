@@ -1,0 +1,28 @@
+# General-purpose multi-model LLM council; model review is not verification.
+mode: full
+deadline_seconds: 600
+per_call_timeout: 28
+solvers:
+  - {family: gpt-oss, strategy: direct}
+  - {family: command, strategy: code}
+  - {family: nemotron, strategy: decompose}
+# Reserved compatibility role; not used by the default pipeline.
+translator: glm
+judge: gemini
+auditor: gemma
+optional:
+  # Free-tier candidates can be unavailable, rate-limited or in cooldown.
+  audit_fallbacks: [minimax]
+  audit_timeout_seconds: 140
+  judge_fallbacks: [glm]
+  quorum_policy: degrade
+  min_proposals: 2
+  # Fast: proposals, concurrent review, judge and optional independent audit.
+  # Thorough: also author revisions and independent re-review.
+  review_depth: fast
+  improvement_rounds: 1
+  # Answer mode for ordinary tasks; document for >=5 numbered headings.
+  # Explicitly use --task-type document for other long-form requests.
+  task_type: auto
+  hedge_seconds: 30
+rate_limits: {}

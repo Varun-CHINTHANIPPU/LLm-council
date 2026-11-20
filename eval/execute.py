@@ -1,0 +1,482 @@
+"""Bounded, opt-in live evaluation. Never claims improvement without scored tasks.
+
+All API usage must be on accounts whose free/non-billed status you verified.
+Use --plan before --confirm-free. No keys or answer texts are committed.
+"""
+from __future__ import annotations
+import argparse
+import asyncio
+import json
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+import time
+import uuid
+from council.budget import RunBudget
+from council.events import EventStore
+from council.full import FullCouncilRunner,QuickCouncilRunner
+from council.transport import FamilyTransport,FamilyUnavailable
+from eval.tasks import load
+from eval.baselines import majority,best_of_n,family_vote
+from eval.arithmetic import check
+from answer_validation import matches_expected
+from council.final_answers import extract_final_answer, select_candidate_answer
+from eval.code_tasks import extract_function_source,hidden_case_outcome,public_case_output
+
+def canonical_vote_answer(text: str) -> str:
+    """Normalize only a terminal answer, not the semantic correctness.
+
+    Numeric 42, 42.0 and 4.2e1-like outputs should not get separate
+    self-consistency votes merely because models format them differently.
+    Boolean yes/true and no/false are also equivalent for truth tasks.
+    """
+    final=extract_final_answer(text)
+    if final is None:
+        return text.strip()
+    lower=final.casefold()
+    if lower in {"true","yes"}:
+        return "yes"
+    if lower in {"false","no"}:
+        return "no"
+    try:
+        number=Decimal(final.replace(",",""))
+        if number.is_finite():
+            return format(number.normalize(),"f")
+    except InvalidOperation:
+        pass
+    return final
+
+
+def recorded_calls(events):
+    """Count provider attempts, including completed-request retries."""
+    return sum(e["event"] in {"model_call_started", "model_call_retry"}
+               for e in events.replay())
+
+
+def requested_baseline_calls(council_calls: int, *, user_limit: int = 0,
+                             safety_cap: int = 55) -> int:
+    """Default: match Council's API-call count, subject to an explicit cap.
+
+    user_limit=0 means try to match the full observed count. A truncated
+    baseline must be flagged as unequal and excluded from paired comparisons.
+    Matching calls is not the same as matching tokens, latency or tool access.
+    """
+    if council_calls < 0 or user_limit < 0 or safety_cap < 1:
+        raise ValueError("Invalid baseline budget")
+    return min(council_calls, user_limit or council_calls, safety_cap)
+
+
+async def run_task(task,transport,events,*,deadline,baseline_samples=0,
+                   mode="full",run_baselines=True,
+                   runner_config=None,skip_vote6=False):
+    q=task["prompt"]
+    budget=RunBudget.start(deadline,reserve=min(15.,deadline/4))
+    initial=time.monotonic()
+    cfg=runner_config
+    if mode=="full":
+        options=(dict(
+            solvers=cfg.solvers,
+            judge_family=cfg.judge,
+            auditor_family=cfg.auditor,
+            auditor_fallbacks=tuple(cfg.optional.get("audit_fallbacks",())),
+            judge_fallbacks=tuple(cfg.optional.get("judge_fallbacks",())),
+            solver_strategies=cfg.solver_strategies)
+            if cfg is not None else {})
+        runner=FullCouncilRunner(transport,events,budget,**options)
+    elif mode=="quick":
+        options=(dict(solver=cfg.solvers[0],
+                      judge_family=cfg.judge,
+                      solver_strategies=cfg.solver_strategies)
+                 if cfg is not None else {})
+        runner=QuickCouncilRunner(transport,events,budget,**options)
+    else:
+        raise ValueError("mode must be quick or full")
+    council=(await runner.run(q,mode="quick") if mode=="quick"
+             else await runner.run(q))
+    model_calls=recorded_calls(events)
+    result=council["research_result"]
+    # final_answer is now always a (labelled, unverified) answer. Only an
+    # answer the runner marks verified may count as a verified answer.
+    final=(council.get("final_answer")
+           if (council.get("answer_selection") or {}).get("verified") is True
+           else None)
+    candidates=council.get("candidate_answers") or {}
+    # Selected/deployable candidate: first verified answer if available,
+    # otherwise the explicit executed-answer tier selected by the runner.
+    # "Any candidate correct" is an ORACLE UPPER BOUND, never the
+    # deployed predictor or an improvement claim.
+    selection=council.get("answer_selection") or select_candidate_answer(
+        candidates,council.get("claims",[]),council.get("evidence",[]),
+        council.get("proposals",[]))
+    selected=final if final is not None else selection.get("answer")
+    output={"task_id":task["id"],"kind":task.get("kind"),
+            "mode":mode,"system":"council","answer":selected,
+            "candidate_answers":candidates,"verified_answer":final,
+            "answer_selection":selection,
+            "executed_agreement_answer":council.get("executed_agreement_answer"),
+            "calls":model_calls,"equal_budget":True,"latency":time.monotonic()-initial,
+            "unresolved":council.get("verdict",{}).get("status")!="answer",
+            "composition_unchecked":council.get("composition",{}).get("outcome")=="unchecked",
+            "answer_basis":selection.get("basis"),
+            "audit_completed":bool((council.get("audit") or {}).get("completed")),
+            "auditor_issue_count":len((council.get("audit") or {}).get("issues") or []),
+            "open_issue_count":selection.get("open_issue_count"),
+            "issue_summary":council.get("issue_summary"),
+            "quorum_met":(council.get("quorum") or {}).get("met")}
+    if "expected" in task:
+        gold=str(task["expected"])
+        output["correct"]=int(selected is not None and
+                              matches_expected(str(selected),gold))
+        output["correct_verified"]=int(final is not None and
+                                      matches_expected(str(final),gold))
+        output["correct_candidate"]=int(any(
+            matches_expected(str(a),gold) for a in candidates.values()
+            if a is not None))
+        output["false_verified"]=int(
+            final is not None and not matches_expected(str(final),gold))
+        output["verified"]=int(final is not None)
+        output["candidate_oracle_upper_bound"]=True
+    else:
+        output["correct"]=None
+        output["correct_verified"]=None
+        output["correct_candidate"]=None
+        output["false_verified"]=None
+        output["manual_review_required"]=True
+    if task.get("kind")=="code" and isinstance(task.get("hidden_spec"),dict):
+        # Selection is syntactic only: never inspect hidden cases to choose a
+        # proposal. The hidden test measures the first runnable code version.
+        sources=[]
+        for proposal in council.get("proposals",[]) or []:
+            if not isinstance(proposal,dict):
+                continue
+            if (selection.get("proposal_id") is not None and
+                    proposal.get("id")!=selection["proposal_id"]):
+                continue
+            artifact=proposal.get("artifact") or {}
+            if isinstance(artifact,dict):
+                sources.append(artifact.get("code"))
+            sources.append(proposal.get("answer") or proposal.get("approach"))
+        # The model may put the actual f(xs) implementation only in
+        # artifact.code; ignoring it was scoring valid implementations
+        # as missing. Selection here is syntax-only, NEVER hidden-gold-based.
+        source=next((v for v in sources if extract_function_source(v)),None)
+        hidden=await asyncio.to_thread(
+            hidden_case_outcome,source,task["hidden_spec"])
+        output["code_hidden_outcome"]=hidden
+        output["sample_correct"]=output.get("correct")
+        output["correct"]=(None if hidden=="unavailable" else
+                           int(hidden=="pass"))
+        # Checking a displayed integer never certifies the whole program.
+        output["correct_verified"]=None
+        output["false_verified"]=None
+        output["verified"]=0
+        # The candidate-oracle figure comes from sample outputs, not hidden
+        # code correctness. Do not compare it against code baselines.
+        output["correct_candidate"]=None
+    if not run_baselines:
+        output["baseline_target_calls"]=0
+        output["comparison_basis"]=(
+            "Two modes compared on the same task; no model baseline was run")
+        return [output]
+    baseline_outputs=[]
+    baseline_start=recorded_calls(events)
+    single_calls=1
+    baseline_budget=RunBudget.start(deadline,reserve=0)
+    baseline_started=time.monotonic()
+    single_latency=None
+    target_samples = requested_baseline_calls(
+        model_calls, user_limit=baseline_samples)
+    output["baseline_target_calls"] = target_samples
+    output["comparison_basis"] = "equal API calls only; token and tool costs not yet matched"
+    for sample_id in range(target_samples):
+        if baseline_budget.remaining()<=5:break
+        try:
+            response=await transport.complete(
+                "gpt-oss",q,baseline_budget,role="baseline",synthesis=True)
+            baseline_outputs.append(response.text)
+            if len(baseline_outputs)==1:
+                single_calls=max(1,recorded_calls(events)-baseline_start)
+                single_latency=time.monotonic()-baseline_started
+        except FamilyUnavailable:
+            break
+    # Uninstrumented test/custom transports still have one call per response.
+    # Real transports include failed calls, fallbacks and retries in the log.
+    baseline_calls=max(len(baseline_outputs),
+                       recorded_calls(events)-baseline_start)
+    if baseline_outputs:
+        # Vote on final answers rather than string-identical explanations.
+        # Use raw code text for code tasks, where matching a sample integer
+        # cannot establish implementation correctness.
+        vote_inputs=([canonical_vote_answer(answer)
+                      for answer in baseline_outputs]
+                     if task.get("kind") in {"numeric","symbolic"}
+                     else baseline_outputs)
+        public_outputs=None
+        if task.get("kind")=="code":
+            public_outputs=[await asyncio.to_thread(public_case_output,a,q)
+                            for a in baseline_outputs]
+            # Keep failed samples in the denominator. Never form a majority
+            # by silently dropping unavailable/invalid implementations.
+            from collections import Counter
+            counts=Counter(v for v in public_outputs if v is not None)
+            winner=next((v for v,n in counts.items()
+                         if 2*n>len(baseline_outputs)),None)
+            from eval.baselines import Baseline
+            code=(baseline_outputs[public_outputs.index(winner)]
+                  if winner is not None else None)
+            vote=Baseline("self_consistency",code,tuple(baseline_outputs),
+                          len(baseline_outputs),"public input execution vote")
+        else:
+            vote=majority(vote_inputs)
+        base={"task_id":task["id"],"system":"self_consistency",
+              "answer":vote.answer,"calls":baseline_calls,
+              "latency":time.monotonic()-baseline_started,
+              "equal_budget":baseline_calls==model_calls,
+              "unresolved":vote.answer is None}
+        if public_outputs is not None:
+            base["public_execution_outputs"]=public_outputs
+            base["selection_basis"]="public_input_execution_majority"
+        if "expected" in task:
+            base["correct"]=int(matches_expected(str(vote.answer or ""),
+                                                 str(task["expected"])))
+        else:base["correct"]=None
+        output_base=[base]
+        single={"task_id":task["id"],"system":"single",
+                "answer":baseline_outputs[0],"calls":single_calls,
+                "latency":single_latency,
+                "equal_budget":model_calls==single_calls,"unresolved":False}
+        single["correct"]=(int(matches_expected(baseline_outputs[0],str(task["expected"])))
+                           if "expected" in task else None)
+        output_base.append(single)
+        # Same arithmetic checker available to Council; gold answer is NOT used
+        # for selection, only to score after choosing.
+        independent=task.get("checker_expression")
+        if independent:
+            def tool_selector(answer):
+                try:
+                    extracted=canonical_vote_answer(answer)
+                    proposed_decimal=Decimal(extracted)
+                    if (not proposed_decimal.is_finite() or
+                            proposed_decimal!=proposed_decimal.to_integral_value()):
+                        return False,0.0
+                    proposed=int(proposed_decimal)
+                    ok=check(independent,proposed).outcome=="pass"
+                    return ok,float(ok)
+                except (ValueError,InvalidOperation,OverflowError):
+                    return False,0.0
+            selected=best_of_n(baseline_outputs,tool_selector)
+            best={"task_id":task["id"],"system":"best_of_n",
+                  "answer":selected.answer,"calls":baseline_calls,
+                  "equal_budget":baseline_calls==model_calls,
+                  "oracle_assisted":True,
+                  "comparison_eligible":False,
+                  "unresolved":selected.answer is None}
+            if "expected" in task:
+                best["correct"]=int(matches_expected(str(selected.answer or ""),
+                                                    str(task["expected"])))
+            else:best["correct"]=None
+            output_base.append(best)
+        elif task.get("kind")=="code":
+            # Public syntax-only selection; hidden fixtures are used ONLY
+            # for scoring, never to choose the winning baseline response.
+            selected=best_of_n(baseline_outputs,
+                lambda answer:(bool(extract_function_source(answer)),
+                               float(bool(extract_function_source(answer)))))
+            best={"task_id":task["id"],"system":"best_of_n",
+                  "answer":selected.answer,"calls":baseline_calls,
+                  "equal_budget":baseline_calls==model_calls,
+                  "unresolved":selected.answer is None,
+                  "correct":None}
+            output_base.append(best)
+    else:output_base=[]
+    # Six-family voting is expensive on free-tier accounts. It can be
+    # disabled independently of 1-model/self-consistency baselines.
+    if skip_vote6:
+        if task.get("kind")=="code" and isinstance(task.get("hidden_spec"),dict):
+            for row in output_base:
+                hidden=await asyncio.to_thread(
+                    hidden_case_outcome,row.get("answer"),task["hidden_spec"])
+                row["code_hidden_outcome"]=hidden
+                row["sample_correct"]=row.get("correct")
+                row["correct"]=(None if hidden=="unavailable"
+                                else int(hidden=="pass"))
+        return [output]+output_base
+    # Plain cross-family voting is a distinct control from repeated gpt-oss.
+    # Six families are required; a provider endpoint never gets an extra vote.
+    family_outputs={}
+    family_start=recorded_calls(events)
+    families=("gpt-oss","command","gemma","nemotron","gemini","glm")
+    family_budget=RunBudget.start(deadline,reserve=0)
+    raw_family_outputs={}
+    family_latency={}
+    for family in families:
+        if family_budget.remaining()<=5:break
+        started=time.monotonic()
+        try:
+            answer=await transport.complete(family,q,family_budget,
+                                             role="baseline_vote6",synthesis=True)
+            family_outputs[family]=answer.text
+            raw_family_outputs[family]=answer.text
+            family_latency[family]=time.monotonic()-started
+        except FamilyUnavailable:
+            continue
+    if task.get("kind") in {"numeric","symbolic"}:
+        family_outputs={family:canonical_vote_answer(text)
+                        for family,text in family_outputs.items()}
+    vote6=family_vote(family_outputs)
+    family_calls=max(vote6.calls,recorded_calls(events)-family_start)
+    vote_row={"task_id":task["id"],"system":"vote6",
+              "answer":vote6.answer,"calls":family_calls,
+              "equal_budget":family_calls==model_calls,
+              "independent_families":len(family_outputs),
+              "unresolved":vote6.answer is None}
+    vote_row["correct"]=(int(matches_expected(str(vote6.answer or ""),
+                            str(task["expected"]))) if "expected" in task else None)
+    if task.get("kind")=="code" and isinstance(task.get("hidden_spec"),dict):
+        for row in output_base+[vote_row]:
+            hidden=await asyncio.to_thread(
+                hidden_case_outcome,row.get("answer"),task["hidden_spec"])
+            row["code_hidden_outcome"]=hidden
+            row["sample_correct"]=row.get("correct")
+            row["correct"]=(None if hidden=="unavailable" else
+                            int(hidden=="pass"))
+    # Each family's vote answer is also an individual-model baseline, at no
+    # extra cost. One call each, so these are NOT call-matched to Council.
+    individual=[]
+    for family,text in raw_family_outputs.items():
+        row={"task_id":task["id"],"system":"single:"+family,"answer":text,
+             "calls":1,"latency":family_latency.get(family),
+             "equal_budget":model_calls==1,"unresolved":False,
+             "individual_model":True}
+        if task.get("kind")=="code" and isinstance(task.get("hidden_spec"),dict):
+            hidden=await asyncio.to_thread(hidden_case_outcome,text,
+                                           task["hidden_spec"])
+            row["code_hidden_outcome"]=hidden
+            row["correct"]=None if hidden=="unavailable" else int(hidden=="pass")
+        else:
+            row["correct"]=(int(matches_expected(text,str(task["expected"])))
+                            if "expected" in task else None)
+        individual.append(row)
+    return [output]+output_base+[vote_row]+individual
+
+async def execute(tasks,*,out_dir:Path,deadline:float,max_tasks:int,
+                  baseline_samples:int,mode:str="full",
+                  rate_limits:dict|None=None,run_baselines=True,
+                  runner_config=None,skip_vote6=False):
+    out_dir.mkdir(parents=True,exist_ok=True)
+    dest=out_dir/"results.jsonl"
+    partial=out_dir/"results.partial.jsonl"
+    # Fail before spending provider quota if prior results or an interrupted
+    # checkpoint exist. Never silently mix old/new experiments.
+    if dest.exists() or partial.exists():
+        raise FileExistsError(
+            "Evaluation results already exist in "+str(out_dir)+
+            "; use a fresh --out directory or manually archive both files")
+    rows=[]
+    shared_quota=None
+    with partial.open("x",encoding="utf-8") as checkpoint:
+      for task in tasks[:max_tasks]:
+        run_id=uuid.uuid4().hex[:16]
+        with EventStore(out_dir,run_id) as events:
+            transport=FamilyTransport(record=events.record)
+            if shared_quota is None:
+                shared_quota=transport.quota
+                for provider,settings in (rate_limits or {}).items():
+                    shared_quota.configure_provider(provider,
+                        rate_per_minute=float(settings["requests_per_minute"]),
+                        burst=int(settings.get("burst",1)),
+                        daily_requests=settings.get("daily_requests"),
+                        daily_tokens=settings.get("daily_tokens"),
+                        tokens_per_minute=settings.get("tokens_per_minute"))
+            else:
+                # Do not reset RPM, TPM, or daily reservations between
+                # adjacent evaluation tasks and baselines.
+                transport.quota=shared_quota
+            fresh=await run_task(task,transport,events,deadline=deadline,
+                                 baseline_samples=baseline_samples,
+                                 mode=mode,
+                                 run_baselines=run_baselines,
+                                 runner_config=runner_config,
+                                 skip_vote6=skip_vote6)
+            rows.extend(fresh)
+            for row in fresh:
+                checkpoint.write(json.dumps(row,ensure_ascii=False)+"\n")
+            checkpoint.flush()
+    partial.replace(dest)
+    return dest,rows
+
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("tasks",type=Path,nargs="?",
+                        help="Task JSONL; --tasks is also supported")
+    parser.add_argument("--tasks",dest="tasks_option",type=Path,
+                        help="Task JSONL path")
+    parser.add_argument("--mode",choices=("quick","full"),default="full")
+    parser.add_argument("--config",type=Path,default=Path("council.yaml"),
+                        help="Optional config with your verified RPM/TPM caps")
+    parser.add_argument("--split",choices=("dev","heldout"),default="dev")
+    parser.add_argument("--max-tasks",type=int,default=3)
+    parser.add_argument("--deadline",type=float,default=240)
+    parser.add_argument("--no-baselines",action="store_true",
+                        help="Run only Council, without self-consistency or six-family API calls")
+    parser.add_argument("--vote6",action="store_true",
+                        help="Opt in to six-family voting and its additional provider calls")
+    parser.add_argument("--skip-vote6",action="store_true",
+                        help="Keep single-model and self-consistency baselines without six-family API calls")
+    parser.add_argument("--baseline-samples",type=int,default=0,
+                        help="0 (default) aims to match Council calls, capped at 55; explicit positive value is a smaller hard cap")
+    parser.add_argument("--out-dir","--out",type=Path,
+                        default=Path("runs")/"eval")
+    parser.add_argument("--confirm-free",action="store_true")
+    args=parser.parse_args(argv)
+    if args.vote6 and args.skip_vote6:
+        parser.error("--vote6 and --skip-vote6 are mutually exclusive")
+    skip_vote6=not args.vote6
+    if not 1<=args.max_tasks<=100 or not 0<=args.baseline_samples<=55:
+        parser.error("Unsafe task or sample count")
+    selected_tasks=args.tasks_option or args.tasks
+    if selected_tasks is None:
+        parser.error("Supply task path or --tasks")
+    tasks=load(selected_tasks,split=args.split)
+    upper_calls=args.max_tasks*(
+        55 if args.no_baselines else
+        55+(args.baseline_samples or 55)+(0 if skip_vote6 else 6))
+    if not args.confirm_free:
+        print(json.dumps({"mode":"plan_only","tasks":min(len(tasks),args.max_tasks),
+                          "per_task_deadline":args.deadline,
+                          "max_possible_calls_warning":upper_calls,
+                          "warning":"No APIs called. Confirm free/non-billed account limits. Equal CALLS are not equal TOKENS or tool availability."},indent=2))
+        return
+    # Checking the sandbox in a separate terminal must not be optional:
+    # otherwise Phase-A can spend provider quota and attempt generated-code
+    # tests even when host-home isolation is known to be broken.
+    from council.preflight import sandbox_report
+    checks=sandbox_report()
+    required=("execution","network_isolation",
+              "host_home_isolation","environment_isolation")
+    failed=[name for name in required
+            if name not in checks or checks[name].status!="pass"]
+    if failed:
+        parser.error("Sandbox preflight failed ("+", ".join(failed)+
+                     "); no provider calls started. Run "
+                     "'python -m council.preflight --json' and fix isolation.")
+    cfg=None
+    rate_limits={}
+    if args.config.is_file():
+        from council.config import load_config
+        cfg=load_config(args.config)
+        rate_limits=cfg.rate_limits
+    if args.mode=="quick" and cfg is not None and not cfg.solvers:
+        parser.error("Quick mode requires a configured solver")
+    path,rows=asyncio.run(execute(tasks,out_dir=args.out_dir,
+                           deadline=args.deadline,max_tasks=args.max_tasks,
+                           baseline_samples=args.baseline_samples,
+                           mode=args.mode,
+                           rate_limits=rate_limits,
+                           run_baselines=not args.no_baselines,
+                           runner_config=cfg,
+                           skip_vote6=skip_vote6))
+    print(json.dumps({"saved":str(path),"rows":len(rows),
+                      "warning":"Open-ended research rows need blinded human scoring"},indent=2))
+
+if __name__=="__main__":
+    main()

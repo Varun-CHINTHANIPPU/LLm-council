@@ -1,0 +1,16 @@
+# Secrets - never commit real API keys
+.env
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+# Local runs and outputs
+runs/
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
+.router_health.json
+all.txt
